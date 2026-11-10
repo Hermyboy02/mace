@@ -12,7 +12,7 @@ from e3nn.util.jit import compile_mode
 
 try:
     from graph_longrange.energy import GTOElectrostaticEnergy
-    from graph_longrange.features import GTOElectrostaticFeatures
+    from graph_longrange.features import GTOElectrostaticFeatures, compute_yukawa_factor
     from graph_longrange.gto_utils import (
         DisplacedGTOExternalFieldBlock,
         gto_basis_kspace_cutoff,
@@ -967,7 +967,7 @@ class PolarMACE(ScaleShiftMACE):
         """Idempotently convert pretrained field maps; this branch is charge-only."""
         from .field_blocks import AgnosticChargeBiasedLinearPotentialEmbedding, TiedSpinFieldLinear
         self.spin_interaction_enabled = False
-        self.spin_yukawa_kappa = None
+        self.spin_yukawa_kappa = getattr(self, "spin_yukawa_kappa", None)  # keep kappa if set
         for module in list(self.modules()):
             if isinstance(module, AgnosticChargeBiasedLinearPotentialEmbedding):
                 if not isinstance(module.potential_linear, TiedSpinFieldLinear):
@@ -986,9 +986,9 @@ class PolarMACE(ScaleShiftMACE):
         self.spin_interaction_enabled = False
 
     def set_spin_yukawa(self, kappa: Optional[float] = None) -> None:
-        """Accept only None: no spin field is propagated on this branch."""
+        """Yukawa spin field with screening kappa (1/Angstrom); None = no spin field."""
         if kappa is not None:
-            raise ValueError("This charge-only branch does not propagate a Yukawa spin field")
+            self.electric_potential_descriptor.configure_yukawa(kappa)
         self.spin_yukawa_kappa = kappa
 
     def set_electrostatic_pbcs(self, pbc_handling: str) -> None:
@@ -1171,6 +1171,12 @@ class PolarMACE(ScaleShiftMACE):
         )
         self.electric_potential_descriptor.static_quantities = None
 
+        # Yukawa spin field is used only when kappa is set.
+        spin_yukawa_kappa = getattr(self, "spin_yukawa_kappa", None)
+        k_factor_yukawa = None
+        if spin_yukawa_kappa is not None and field_feature_cache.get("mode") == "pbc":
+            k_factor_yukawa = compute_yukawa_factor(kv_norms_squared, spin_yukawa_kappa)
+
         # SCF fixed point
         features_mixed = self.layer_feature_mixer(torch.stack(node_feats_list, dim=0))
         spin_charge_density = spin_charge_density.view(
@@ -1230,6 +1236,15 @@ class PolarMACE(ScaleShiftMACE):
             )
             field_feats_alpha = 0.5 * field_charge
             field_feats_beta = 0.5 * field_charge
+            if spin_yukawa_kappa is not None:
+                # Yukawa spin field from alpha-beta: added to alpha, subtracted from beta.
+                field_spin = self.electric_potential_descriptor.forward_dynamic_yukawa(
+                    cache=field_feature_cache,
+                    source_feats=source_feats_alpha - source_feats_beta,
+                    k_factor_yukawa=k_factor_yukawa,
+                )
+                field_feats_alpha = field_feats_alpha + 0.5 * field_spin
+                field_feats_beta = field_feats_beta - 0.5 * field_spin
             field_from_mul_ir = getattr(self, "_field_from_mul_ir", None)
             if field_from_mul_ir is not None:
                 field_feats_alpha = field_from_mul_ir(field_feats_alpha)
