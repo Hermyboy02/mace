@@ -26,6 +26,34 @@ from .wrapper_ops import (
 )
 
 
+def swap_spin_channels(x: torch.Tensor) -> torch.Tensor:
+    """Swap the two spin channels of a per-atom tensor.
+
+    x has shape [N, 2*k], laid out as [alpha (k numbers) | beta (k numbers)].
+    Returns [beta | alpha] with the same shape.
+    """
+    n = x.shape[0]
+    return x.reshape(n, 2, -1).flip(1).reshape(n, -1)
+
+
+def mix_labelings(
+    as_given: torch.Tensor,
+    swapped_back: torch.Tensor,
+    label_weight: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Per-atom weighted mix of two results: w * as_given + (1 - w) * swapped_back.
+
+    label_weight has shape [N]: 1 if alpha is the majority spin, 0 if beta is,
+    0.5 if they are equal. None means 0.5 for every atom (plain average).
+    """
+    if label_weight is None:
+        return 0.5 * (as_given + swapped_back)
+    w = label_weight
+    while w.dim() < as_given.dim():
+        w = w.unsqueeze(-1)
+    return w * as_given + (1.0 - w) * swapped_back
+
+
 @compile_mode("script")
 class MultiLayerFeatureMixer(torch.nn.Module):
     def __init__(
@@ -64,12 +92,16 @@ class EnvironmentDependentSpinSourceBlock(torch.nn.Module):
         self.irreps_out = 2 * o3.Irreps.spherical_harmonics(max_l)
         self.linear = Linear(irreps_in, self.irreps_out, cueq_config=cueq_config)
 
-    def forward(self, node_feats: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, node_feats: torch.Tensor, label_weight: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         mp = self.linear(node_feats)
         if self.zero_charges:
             mp_z = torch.zeros_like(mp)
             mp_z[:, 1:] = mp[:, 1:]
             mp = mp_z
+        # node_feats is spin-blind, so swapping labels just swaps the halves.
+        mp = mix_labelings(mp, swap_spin_channels(mp), label_weight)
         return mp.unsqueeze(-2)  # [n_nodes, 1, (max_l+1)^2 * 2]
 
 
@@ -611,8 +643,36 @@ class AgnosticEmbeddedOneBodyVariableUpdate(FieldUpdateBlock):
         edge_index: torch.Tensor,
         potential_features: torch.Tensor,
         local_charges: torch.Tensor,
+        label_weight: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # create pot feats
+        # Run the learned update with the given labels and with alpha/beta
+        # swapped, then mix them so the result cannot depend on the labels.
+        out = self._update_unsymmetrized(
+            node_attrs, node_feats, potential_features, local_charges
+        )
+        out_swapped = self._update_unsymmetrized(
+            node_attrs,
+            node_feats,
+            swap_spin_channels(potential_features),
+            swap_spin_channels(local_charges),
+        )
+        # Layout of both: [multipoles_alpha | multipoles_beta | fukui_alpha | fukui_beta]
+        # Put each part of out_swapped back into the normal channel order.
+        n_fukui = 2
+        mp_back = swap_spin_channels(out_swapped[:, :-n_fukui])
+        fk_back = swap_spin_channels(out_swapped[:, -n_fukui:])
+        mp = mix_labelings(out[:, :-n_fukui], mp_back, label_weight)
+        fk = mix_labelings(out[:, -n_fukui:], fk_back, label_weight)
+        return torch.cat([mp, fk], dim=-1)
+
+    def _update_unsymmetrized(
+        self,
+        node_attrs: torch.Tensor,
+        node_feats: torch.Tensor,
+        potential_features: torch.Tensor,
+        local_charges: torch.Tensor,
+    ) -> torch.Tensor:
+        # Original update body (unchanged).
         mixed_feats = self.potential_embedding(
             potential_features,
             node_feats,
@@ -767,7 +827,29 @@ class OneBodyMLPFieldReadout(PostScfReadout):
         field_feats: torch.Tensor,
         charges_0: torch.Tensor,
         charges_induced: torch.Tensor,
+        label_weight: Optional[torch.Tensor] = None,
     ):
+        # Energy with the given labels and with alpha/beta swapped, mixed so the
+        # total cannot depend on which channel is called alpha.
+        e = self._energy_unsymmetrized(
+            node_feats, field_feats, charges_0, charges_induced
+        )
+        e_swapped = self._energy_unsymmetrized(
+            node_feats,
+            swap_spin_channels(field_feats),
+            swap_spin_channels(charges_0),
+            swap_spin_channels(charges_induced),
+        )
+        return mix_labelings(e, e_swapped, label_weight)
+
+    def _energy_unsymmetrized(
+        self,
+        node_feats: torch.Tensor,
+        field_feats: torch.Tensor,
+        charges_0: torch.Tensor,
+        charges_induced: torch.Tensor,
+    ) -> torch.Tensor:
+        # Original energy body (unchanged).
         q_in = charges_induced + charges_0
         q_to_mul_ir = getattr(self, "_q_to_mul_ir", None)
         v_to_mul_ir = getattr(self, "_v_to_mul_ir", None)

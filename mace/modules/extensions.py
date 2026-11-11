@@ -66,6 +66,7 @@ from .field_blocks import (
     MultiLayerFeatureMixer,
     field_readout_blocks,
     field_update_blocks,
+    mix_labelings,
 )
 from .radial import ZBLBasis
 from .utils import get_edge_vectors_and_lengths, get_symmetric_displacement
@@ -1094,6 +1095,15 @@ class PolarMACE(ScaleShiftMACE):
         else:
             pair_node_energy = torch.zeros_like(node_e0)
 
+        # Which labeling the pretrained maps should see, per atom:
+        # 1.0 if alpha is the majority spin (the convention used in training),
+        # 0.0 if beta is (the maps then see the labels swapped),
+        # 0.5 if N_alpha == N_beta (average both labelings).
+        spin_excess = data["total_spin"] - 1  # N_alpha - N_beta per graph
+        label_weight = (0.5 + 0.5 * torch.sign(spin_excess))[data["batch"]].to(
+            vectors.dtype
+        )
+
         node_es_list: List[torch.Tensor] = []
         node_feats_list: List[torch.Tensor] = []
         spin_charge_density = torch.zeros(
@@ -1132,7 +1142,7 @@ class PolarMACE(ScaleShiftMACE):
             ]
             node_es_list.append(node_es)
 
-            spin_charge_sources = lr_src(node_feats).squeeze(-2)
+            spin_charge_sources = lr_src(node_feats, label_weight).squeeze(-2)
             spin_charge_density = spin_charge_density + spin_charge_sources
 
         node_feats_out = torch.cat(node_feats_list, dim=-1)
@@ -1180,7 +1190,11 @@ class PolarMACE(ScaleShiftMACE):
         fukui_to_mul_ir = getattr(self, "_fukui_to_mul_ir", None)
         if fukui_to_mul_ir is not None:
             fukui_input = fukui_to_mul_ir(fukui_input)
-        fukui_sources = self.fukui_source_map(fukui_input)
+        fukui_sources = self.fukui_source_map(fukui_input)  # [n_nodes, 2]
+        # Inputs are spin-blind, so swapping labels just swaps the two columns.
+        fukui_sources = mix_labelings(
+            fukui_sources, fukui_sources.flip(-1), label_weight
+        )
         fukui_norm = scatter_sum(
             src=safe_double(fukui_sources),
             index=data["batch"],
@@ -1191,6 +1205,8 @@ class PolarMACE(ScaleShiftMACE):
             fukui_norm == 0, torch.ones_like(fukui_norm), fukui_norm
         )
         fukui_sources = fukui_sources / fukui_norm
+        # total_spin - 1 = N_alpha - N_beta (may be negative). Flipping its
+        # sign only swaps the alpha and beta outputs.
         Q_p_S = (data["total_charge"] + (data["total_spin"] - 1))[data["batch"]]
         Q_m_S = (data["total_charge"] - (data["total_spin"] - 1))[data["batch"]]
         pred_total_charges_0 = scatter_sum(
@@ -1268,6 +1284,7 @@ class PolarMACE(ScaleShiftMACE):
                 local_charges=spin_charge_density.view(
                     spin_charge_density.shape[0], -1
                 ),
+                label_weight=label_weight,
             )
 
             current_fukui_sources = charge_sources_out[:, -2:]
@@ -1316,6 +1333,7 @@ class PolarMACE(ScaleShiftMACE):
                 field_independent_spin_charge_density.shape[0], -1
             ),
             charges_induced=spin_charge_density.view(spin_charge_density.shape[0], -1),
+            label_weight=label_weight,
         )
         le_total = scatter_sum(
             src=local_q_e, index=data["batch"], dim=-1, dim_size=num_graphs
