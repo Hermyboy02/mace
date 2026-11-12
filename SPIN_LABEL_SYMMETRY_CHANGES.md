@@ -1,7 +1,10 @@
 # Spin label symmetry: line-by-line change log
 
-Branch: `spin-label-symmetry` (local only, created from `tie-spin-field-weights` @ 241883f).
-Date: 2026-11-11. Files changed: 2. Lines removed: 4. Lines added: 104.
+Branch: `spin-label-symmetry`, created from `tie-spin-field-weights` @ 241883f.
+
+Entries:
+1. 2026-11-11: spin label symmetry (commit e428521)
+2. 2026-11-12: Fukui normalisation fix for N_alpha == N_beta (not committed yet)
 
 Each changed line is shown with its line number: `[old N]` = line number in the file
 before the change (removed lines), `[new N]` = line number after the change (added lines).
@@ -11,6 +14,11 @@ Purpose: make PolarMACE exactly symmetric under swapping alpha and beta electron
 keeping every weight shape so `polar-1-m` can still be loaded for fine-tuning. The
 pretrained maps always see the majority spin as alpha; when N_alpha == N_beta both
 labelings are averaged.
+
+## Entry 1: spin label symmetry (2026-11-11, commit e428521)
+
+Files changed: 2. Lines removed: 4. Lines added: 104.
+Line numbers refer to the files before (`old`) and after (`new`) this entry.
 
 ### `mace/modules/extensions.py`
 
@@ -182,7 +190,7 @@ labelings are averaged.
 + [new  852]         # Original energy body (unchanged).
 ```
 
-## Full unified diff
+### Full unified diff (entry 1)
 
 ```diff
 diff --git a/mace/modules/extensions.py b/mace/modules/extensions.py
@@ -385,4 +393,226 @@ index 57dd290..45ccf4b 100644
          q_in = charges_induced + charges_0
          q_to_mul_ir = getattr(self, "_q_to_mul_ir", None)
          v_to_mul_ir = getattr(self, "_v_to_mul_ir", None)
+```
+
+## Entry 2: Fukui normalisation fix for N_alpha == N_beta (2026-11-12, not committed)
+
+Files changed: 2. Lines removed: 23. Lines added: 36.
+Line numbers refer to the files after entry 1 (`old`) and after this entry (`new`).
+
+Problem: when N_alpha == N_beta (spin=1), entry 1 averaged the raw alpha and beta Fukui
+weights and then divided by their sum. That sum can be close to zero, which blew up the
+charges (Cr2O2 spin=1: charges of +-836 e; CO: energy off by +51 eV).
+
+Fix: normalise each labeling's Fukui weights first (each then sums to 1 per graph), then
+mix. Results for N_alpha != N_beta are unchanged. The update block now returns both
+labelings' Fukui weights unmixed ([N, 12] instead of [N, 10]); no weight shapes change.
+
+Checks (polar-1-m, float64): CO back to +0.32 eV of the original model, Cr2O2 spin=1
+charges +-3.5 e, alpha/beta swap symmetry exact, 60 polar tests pass, spin=2/0 results
+identical to entry 1.
+
+### `mace/modules/extensions.py`
+
+
+**Inserted after old line 663 → new lines 664–678**
+```diff
++ [new  664] 
++ [new  665] 
++ [new  666] def _normalize_fukui_per_graph(
++ [new  667]     fukui: torch.Tensor, batch: torch.Tensor, num_graphs: int
++ [new  668] ) -> torch.Tensor:
++ [new  669]     """Divide each Fukui column by its sum over the atoms of the same graph.
++ [new  670] 
++ [new  671]     fukui: [n_nodes, 2] (alpha, beta columns). Returns the same shape; each
++ [new  672]     column then sums to 1 per graph (a zero sum is left undivided).
++ [new  673]     """
++ [new  674]     norm = scatter_sum(
++ [new  675]         src=safe_double(fukui), index=batch, dim=0, dim_size=num_graphs
++ [new  676]     )[batch].to(fukui.dtype)
++ [new  677]     norm = torch.where(norm == 0, torch.ones_like(norm), norm)
++ [new  678]     return fukui / norm
+```
+
+**Inserted after old line 1193 → new lines 1209–1213**
+```diff
++ [new 1209]         # Normalise first (each column sums to 1 per graph), then mix the two
++ [new 1210]         # labelings. Mixing first can make the normaliser nearly zero.
++ [new 1211]         fukui_sources = _normalize_fukui_per_graph(
++ [new 1212]             fukui_sources, data["batch"], num_graphs
++ [new 1213]         )
+```
+
+**Old lines 1197–1205 removed (after new line 1216)**
+```diff
+- [old 1197]         )
+- [old 1198]         fukui_norm = scatter_sum(
+- [old 1199]             src=safe_double(fukui_sources),
+- [old 1200]             index=data["batch"],
+- [old 1201]             dim=0,
+- [old 1202]             dim_size=num_graphs,
+- [old 1203]         )[data["batch"]].to(vectors.dtype)
+- [old 1204]         fukui_norm = torch.where(
+- [old 1205]             fukui_norm == 0, torch.ones_like(fukui_norm), fukui_norm
+```
+
+**Old lines 1207–1207 removed (after new line 1217)**
+```diff
+- [old 1207]         fukui_sources = fukui_sources / fukui_norm
+```
+
+**Old lines 1290–1291 → new lines 1300–1303**
+```diff
+- [old 1290]             current_fukui_sources = charge_sources_out[:, -2:]
+- [old 1291]             charge_sources = charge_sources_out[:, :-2]
++ [new 1300]             # Block output: [multipoles (mixed) | fukui as given (2) | fukui swapped back (2)]
++ [new 1301]             fukui_as_given = charge_sources_out[:, -4:-2]
++ [new 1302]             fukui_swapped_back = charge_sources_out[:, -2:]
++ [new 1303]             charge_sources = charge_sources_out[:, :-4]
+```
+
+**Old lines 1299–1306 → new lines 1311–1317**
+```diff
+- [old 1299]             fukui_norm2 = scatter_sum(
+- [old 1300]                 src=safe_double(current_fukui_sources),
+- [old 1301]                 index=data["batch"],
+- [old 1302]                 dim=0,
+- [old 1303]                 dim_size=num_graphs,
+- [old 1304]             )[data["batch"]].to(vectors.dtype)
+- [old 1305]             fukui_norm2 = torch.where(
+- [old 1306]                 fukui_norm2 == 0, torch.ones_like(fukui_norm2), fukui_norm2
++ [new 1311]             # Normalise each labeling's Fukui weights first, then mix them.
++ [new 1312]             current_fukui_sources = mix_labelings(
++ [new 1313]                 _normalize_fukui_per_graph(fukui_as_given, data["batch"], num_graphs),
++ [new 1314]                 _normalize_fukui_per_graph(
++ [new 1315]                     fukui_swapped_back, data["batch"], num_graphs
++ [new 1316]                 ),
++ [new 1317]                 label_weight,
+```
+
+**Old lines 1308–1308 removed (after new line 1318)**
+```diff
+- [old 1308]             current_fukui_sources = current_fukui_sources / fukui_norm2
+```
+
+### `mace/modules/field_blocks.py`
+
+
+**Old lines 665–666 → new lines 665–669**
+```diff
+- [old  665]         fk = mix_labelings(out[:, -n_fukui:], fk_back, label_weight)
+- [old  666]         return torch.cat([mp, fk], dim=-1)
++ [new  665]         # Fukui weights are returned unmixed, for both labelings: the caller
++ [new  666]         # must normalise each one over the graph before mixing them, or the
++ [new  667]         # normaliser can be close to zero.
++ [new  668]         # Output: [mixed multipoles | fukui as given (2) | fukui swapped back (2)]
++ [new  669]         return torch.cat([mp, out[:, -n_fukui:], fk_back], dim=-1)
+```
+
+### Full unified diff (entry 2)
+
+```diff
+--- a/mace/modules/extensions.py
++++ b/mace/modules/extensions.py
+@@ -661,6 +661,21 @@
+             "latent_quads": les_quad,
+             "BEC": les_result["BEC"],
+         }
++
++
++def _normalize_fukui_per_graph(
++    fukui: torch.Tensor, batch: torch.Tensor, num_graphs: int
++) -> torch.Tensor:
++    """Divide each Fukui column by its sum over the atoms of the same graph.
++
++    fukui: [n_nodes, 2] (alpha, beta columns). Returns the same shape; each
++    column then sums to 1 per graph (a zero sum is left undivided).
++    """
++    norm = scatter_sum(
++        src=safe_double(fukui), index=batch, dim=0, dim_size=num_graphs
++    )[batch].to(fukui.dtype)
++    norm = torch.where(norm == 0, torch.ones_like(norm), norm)
++    return fukui / norm
+ 
+ 
+ def _permute_to_e3nn_convention(x: torch.Tensor) -> torch.Tensor:
+@@ -1191,20 +1206,15 @@
+         if fukui_to_mul_ir is not None:
+             fukui_input = fukui_to_mul_ir(fukui_input)
+         fukui_sources = self.fukui_source_map(fukui_input)  # [n_nodes, 2]
++        # Normalise first (each column sums to 1 per graph), then mix the two
++        # labelings. Mixing first can make the normaliser nearly zero.
++        fukui_sources = _normalize_fukui_per_graph(
++            fukui_sources, data["batch"], num_graphs
++        )
+         # Inputs are spin-blind, so swapping labels just swaps the two columns.
+         fukui_sources = mix_labelings(
+             fukui_sources, fukui_sources.flip(-1), label_weight
+-        )
+-        fukui_norm = scatter_sum(
+-            src=safe_double(fukui_sources),
+-            index=data["batch"],
+-            dim=0,
+-            dim_size=num_graphs,
+-        )[data["batch"]].to(vectors.dtype)
+-        fukui_norm = torch.where(
+-            fukui_norm == 0, torch.ones_like(fukui_norm), fukui_norm
+         )
+-        fukui_sources = fukui_sources / fukui_norm
+         # total_spin - 1 = N_alpha - N_beta (may be negative). Flipping its
+         # sign only swaps the alpha and beta outputs.
+         Q_p_S = (data["total_charge"] + (data["total_spin"] - 1))[data["batch"]]
+@@ -1287,8 +1297,10 @@
+                 label_weight=label_weight,
+             )
+ 
+-            current_fukui_sources = charge_sources_out[:, -2:]
+-            charge_sources = charge_sources_out[:, :-2]
++            # Block output: [multipoles (mixed) | fukui as given (2) | fukui swapped back (2)]
++            fukui_as_given = charge_sources_out[:, -4:-2]
++            fukui_swapped_back = charge_sources_out[:, -2:]
++            charge_sources = charge_sources_out[:, :-4]
+             # print("charge_sources", charge_sources)
+             # print("current_fukui_sources", current_fukui_sources)
+             spin_charge_density_sources = charge_sources.view(
+@@ -1296,16 +1308,14 @@
+             )
+             spin_charge_density = spin_charge_density + spin_charge_density_sources
+ 
+-            fukui_norm2 = scatter_sum(
+-                src=safe_double(current_fukui_sources),
+-                index=data["batch"],
+-                dim=0,
+-                dim_size=num_graphs,
+-            )[data["batch"]].to(vectors.dtype)
+-            fukui_norm2 = torch.where(
+-                fukui_norm2 == 0, torch.ones_like(fukui_norm2), fukui_norm2
++            # Normalise each labeling's Fukui weights first, then mix them.
++            current_fukui_sources = mix_labelings(
++                _normalize_fukui_per_graph(fukui_as_given, data["batch"], num_graphs),
++                _normalize_fukui_per_graph(
++                    fukui_swapped_back, data["batch"], num_graphs
++                ),
++                label_weight,
+             )
+-            current_fukui_sources = current_fukui_sources / fukui_norm2
+             final_fukui_sources = current_fukui_sources
+             pred_total_charges = scatter_sum(
+                 src=safe_double(spin_charge_density[:, :, 0]),
+--- a/mace/modules/field_blocks.py
++++ b/mace/modules/field_blocks.py
+@@ -662,8 +662,11 @@
+         mp_back = swap_spin_channels(out_swapped[:, :-n_fukui])
+         fk_back = swap_spin_channels(out_swapped[:, -n_fukui:])
+         mp = mix_labelings(out[:, :-n_fukui], mp_back, label_weight)
+-        fk = mix_labelings(out[:, -n_fukui:], fk_back, label_weight)
+-        return torch.cat([mp, fk], dim=-1)
++        # Fukui weights are returned unmixed, for both labelings: the caller
++        # must normalise each one over the graph before mixing them, or the
++        # normaliser can be close to zero.
++        # Output: [mixed multipoles | fukui as given (2) | fukui swapped back (2)]
++        return torch.cat([mp, out[:, -n_fukui:], fk_back], dim=-1)
+ 
+     def _update_unsymmetrized(
+         self,
 ```

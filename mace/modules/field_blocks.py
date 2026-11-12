@@ -662,8 +662,11 @@ class AgnosticEmbeddedOneBodyVariableUpdate(FieldUpdateBlock):
         mp_back = swap_spin_channels(out_swapped[:, :-n_fukui])
         fk_back = swap_spin_channels(out_swapped[:, -n_fukui:])
         mp = mix_labelings(out[:, :-n_fukui], mp_back, label_weight)
-        fk = mix_labelings(out[:, -n_fukui:], fk_back, label_weight)
-        return torch.cat([mp, fk], dim=-1)
+        # Fukui weights are returned unmixed, for both labelings: the caller
+        # must normalise each one over the graph before mixing them, or the
+        # normaliser can be close to zero.
+        # Output: [mixed multipoles | fukui as given (2) | fukui swapped back (2)]
+        return torch.cat([mp, out[:, -n_fukui:], fk_back], dim=-1)
 
     def _update_unsymmetrized(
         self,
